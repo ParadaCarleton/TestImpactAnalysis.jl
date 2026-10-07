@@ -1230,6 +1230,13 @@ function main(args::AbstractVector{<:AbstractString})::Nothing
             sources = ["src"]
         end
         shard = parse.(Int, split(option_value(args, "--shard", "1/1"), '/'))
+        commits = option_values(args, "--commit")
+        commit = ""
+        if isempty(commits)
+            commit = strip(git(root, "rev-parse", "HEAD"))
+        else
+            commit = last(commits)
+        end
         build_map(
             root,
             map_path;
@@ -1241,7 +1248,7 @@ function main(args::AbstractVector{<:AbstractString})::Nothing
             only = option_values(args, "--only"),
             shard = first(shard),
             shards = last(shard),
-            commit = option_value(args, "--commit", strip(git(root, "rev-parse", "HEAD"))),
+            commit = commit,
             environment = [String(first(pair)) => String(last(pair)) for pair in split.(option_values(args, "--env"), '='; limit = 2)],
         )
         return nothing
