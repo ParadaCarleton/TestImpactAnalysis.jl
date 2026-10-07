@@ -1,0 +1,17 @@
+name = "TestImpactAnalysis"
+uuid = "274ebb9d-e75a-429a-8580-dde01b904bae"
+version = "0.1.0"
+
+[deps]
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
+TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
+
+[compat]
+julia = "1.12"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85b1-65a698dbd24e"
+
+[targets]
+test = ["Test"]

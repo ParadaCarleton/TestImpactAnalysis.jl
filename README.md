@@ -1,0 +1,108 @@
+# TestImpactAnalysis
+
+Test impact analysis (regression test selection) for Julia packages: after an edit, run
+only the testsets the edit can affect. It uses only the standard library and never loads
+the package under test, so it runs from any environment (`julia >= 1.12`).
+
+It expects a test entry file (default `test/runtests.jl`) that holds top-level `@testset`s
+with literal names, and a runner script (default `test/runtests.jl`) that runs the testsets
+whose name matches a regex given as its first argument, as ReTest does.
+
+```
+julia --startup-file=no packages/TestImpactAnalysis/bin/testimpact.jl COMMAND [options]
+```
+
+| Command | What it does |
+| --- | --- |
+| `build` | Runs every top-level testset in its own Julia process under `--code-coverage` and writes the map |
+| `merge` | Joins the maps of a sharded build |
+| `select` | Prints the testsets a change can affect, each with the rule that chose it, and a regex for the runner |
+| `run` | `select`, then runs the selected testsets through the runner |
+
+Options (`--root` defaults to the current directory, `--map` to `ROOT/test-impact-map.toml`):
+
+| Option | Commands | Meaning |
+| --- | --- | --- |
+| `--tests FILE` | build | Test entry file, searched for testsets and followed through literal `include`s |
+| `--source DIR` | build | Source directory to cover; repeatable (default `src`) |
+| `--runner FILE` | build, run | Runner script (default `test/runtests.jl`) |
+| `--jobs N` | build | Testsets run at once |
+| `--timeout SECONDS` | build | Per-testset limit; on timeout the process gets SIGINT, so it still writes its coverage |
+| `--only SUBSTRING` | build | Map only matching testsets, for a smoke run |
+| `--shard K/N` | build | Map shard K of N |
+| `--commit REV` | build | Commit recorded in the map (default `git rev-parse HEAD`) |
+| `--env NAME=VALUE` | build | Environment variable for each testset process; repeatable |
+| `--in MAP` | merge | A shard map; repeatable |
+| `--base REV`, `--to REV` | select, run | Compare `--base` (default the map's commit) with `--to` (default the working tree, untracked files included) |
+
+## Build the map
+
+Every top-level testset runs in its own process under `--code-coverage=@<source dir>`.
+The map records which source lines each testset executed, the tree's commit, and the git
+blob hash of every source file. A runner that starts distributed workers would start them
+without the coverage flags: use `--env` to keep each testset in the coverage-flagged process
+(for ReTest-style runners, a variable the runner reads).
+
+A build can be split into shards, dealt round-robin by source length and run from one tree
+so they share a commit, then joined:
+
+```
+for k in 1 2 3 4; do
+  testimpact.jl build --source src --jobs 8 --shard $k/4 --map shard-$k-map.toml
+done
+testimpact.jl merge --map map.toml --in shard-1-map.toml --in shard-2-map.toml ...
+```
+
+- In each shard the smallest testset runs alone first, so the coverage-flagged
+  precompile is built once. The rest then run `--jobs` at a time, longest first.
+- `merge` refuses shards from different commits or files, and a testset mapped twice.
+- A testset's status is `ok`, `failed`, `timeout` or `no-coverage`. Only `ok` coverage is
+  trusted in full; `select` lists every other status as a note.
+
+## Select
+
+`select` diffs `--base` against the working tree, or against `--to REV`. In a jj workspace
+that is not colocated, pass `--to <commit of @>`. Each selected testset is printed with the
+rule that chose it, followed by a regex for the runner.
+
+| Change | Selected |
+| --- | --- |
+| `Project.toml` / `Manifest*.toml` (root or a source dir) | the full suite |
+| a function's body | testsets that executed a line of it |
+| a function's signature, or a method added or removed | testsets that executed any method of that name |
+| a struct, abstract/primitive type, const, global, macro, `@enum`, `using`, rule macro… | testsets that executed a function mentioning one of its names, or whose own code mentions it. Names spread through definitions that mention them (`const V = Vector{S}`). |
+| a testset | that testset |
+| a test helper or test constant | testsets that mention it, transitively |
+| a non-`.jl` file under the tests directory | testsets whose code or helpers name the file |
+| any `.jl` file | static-analysis testsets: JET, Aqua, `readdir`/`walkdir`/`pkgdir` scans and `names(mod; all = true)` introspection, and their helpers |
+
+- Blank lines, comments and docstrings are ignored. A change counts only if the code
+  tokens change.
+- A changed function that no testset executed is printed as `UNCOVERED`. So is a new
+  function that no testset runs or names.
+- A file that does not parse stops the selector with the parser's message.
+- If a mapped source file at `--base` differs from the file the map was built on, the
+  selector refuses to run, because its line numbers would point at the wrong code.
+
+## Blind spots
+
+- Coverage comes from one run. A branch taken only on some seeds or thread schedules
+  is missed by the testsets that did not take it that time.
+- Coverage counts lines, not specializations. A `@generated` body, or code run only at
+  compile time, is covered when it is generated. Code inlined into a dependency's
+  precompiled image is not covered at all.
+- Names are matched as identifiers, with no scope. A local variable that shares a
+  changed global's name selects too much. A name reached only through `getfield`,
+  `@eval` interpolation or a string selects too little.
+- Testsets are run by name. A testset with an interpolated name, or one inside a
+  loop, cannot be mapped: `build` stops on the first and warns on the second.
+- Code outside the mapped source directories (`scripts/`, `benchmarks/`, registered
+  dependencies) is not covered. A change there selects only the static-analysis testsets.
+- A static-analysis testset cannot say which files it reads, so any `.jl` change
+  selects all of them, a test-only edit included (JET then runs for a test edit).
+
+## Tests
+
+```
+julia --startup-file=no --project=packages/TestImpactAnalysis packages/TestImpactAnalysis/test/runtests.jl
+```
