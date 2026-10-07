@@ -403,29 +403,42 @@ function tree_blobs(root::AbstractString, revision::AbstractString)::Dict{String
     return Dict(String(row[4]) => String(row[3]) for row in rows)
 end
 
-"The blob hash git would give a file's current contents."
-function blob_hash(path::AbstractString)::String
-    bytes = read(path)
-    header = Vector{UInt8}(codeunits(string("blob ", length(bytes), "\0")))
-    return bytes2hex(SHA.sha1(vcat(header, bytes)))
+"The `.jl` files under the `sources` directories at `revision`."
+function source_files(root::AbstractString, revision::AbstractString, sources::AbstractVector{<:AbstractString})::Vector{String}
+    return sort([
+        path for path in keys(tree_blobs(root, revision))
+            if endswith(path, ".jl") && any(startswith(path, string(dir, "/")) for dir in sources)
+    ])
 end
 
 # ---------------------------------------------------------------------------------------
 # Coverage map
 # ---------------------------------------------------------------------------------------
 
+"""
+One testset's coverage: its status, wall time, and for each source file the signature
+headers of the functions it executed (a function counts as run when any of its lines,
+signature to `end`, ran).
+"""
 struct TestsetCoverage
     status::String
     ms::Int
-    lines::Dict{String,Vector{UnitRange{Int}}}
+    functions::Dict{String,Set{String}}
 end
 
+"""
+A coverage map. `definitions` lists each source file's function headers at `commit`, in
+file order, and a testset's coverage names functions by their position in that list. A
+function is known by its file and its signature header without whitespace, so methods
+sharing a name are told apart by their arguments, and an edit elsewhere in the file
+leaves the identity alone.
+"""
 struct CoverageMap
     commit::String
     tests::String
     sources::Vector{String}
     runner::String
-    blobs::Dict{String,String}
+    definitions::Dict{String,Vector{String}}
     testsets::Dict{String,TestsetCoverage}
 end
 
@@ -452,43 +465,51 @@ function parse_ranges(text::AbstractString)::Vector{UnitRange{Int}}
     return [parse(Int, first(pair)):parse(Int, last(pair)) for pair in bounds]
 end
 
+"The headers at `positions` (as `ranges_text` writes them) of a file's function list."
+function headers_at(headers::AbstractVector{String}, positions::AbstractString)::Set{String}
+    return Set(headers[position] for range in parse_ranges(positions) for position in range)
+end
+
 function read_map(path::AbstractString)::CoverageMap
     document = TOML.parsefile(path)
+    if !haskey(document, "definitions")
+        error(path, " is a line map from before definition identities; rebuild it with `build`")
+    end
     meta = document["meta"]
+    definitions = Dict(String(file) => String[headers...] for (file, headers) in document["definitions"])
     testsets = Dict(
         String(name) => TestsetCoverage(
                 entry["status"],
                 entry["ms"],
-                Dict(String(file) => parse_ranges(text) for (file, text) in entry["lines"]),
+                Dict(String(file) => headers_at(definitions[file], positions) for (file, positions) in entry["functions"]),
             ) for (name, entry) in document["testsets"]
     )
-    return CoverageMap(
-        meta["commit"],
-        meta["tests"],
-        String[meta["sources"]...],
-        meta["runner"],
-        Dict(String(file) => String(hash) for (file, hash) in document["blobs"]),
-        testsets,
-    )
+    return CoverageMap(meta["commit"], meta["tests"], String[meta["sources"]...], meta["runner"], definitions, testsets)
 end
 
-struct Overlap
-    low::Int
-    high::Int
-end
+"""
+    mapped_file(map, path, item)
 
-(overlap::Overlap)(range::AbstractUnitRange)::Bool = first(range) <= overlap.high && last(range) >= overlap.low
-
-function covers(entry::TestsetCoverage, path::AbstractString, item::Item)::Bool
-    if !haskey(entry.lines, path)
-        return false
+The file whose map definitions hold function `item`'s header: `path` itself, else the
+one other file defining that header (the function moved since the map was built). Empty
+when the map has no such function: it was added, renamed or re-signed since the map was
+built, or its header is defined in several other files.
+"""
+function mapped_file(map::CoverageMap, path::AbstractString, item::Item)::String
+    if item.header in get(map.definitions, path, String[])
+        return String(path)
     end
-    return any(Overlap(item.first, item.last), entry.lines[path])
+    holders = [file for (file, headers) in map.definitions if item.header in headers]
+    if length(holders) == 1
+        return only(holders)
+    end
+    return ""
 end
 
-"Names of the map's testsets that executed a line of `item`."
+"Names of the map's testsets that executed function `item`."
 function covering(map::CoverageMap, path::AbstractString, item::Item)::Vector{String}
-    return sort([name for (name, entry) in map.testsets if covers(entry, path, item)])
+    file = mapped_file(map, path, item)
+    return sort([name for (name, entry) in map.testsets if item.header in get(entry.functions, file, Set{String}())])
 end
 
 # ---------------------------------------------------------------------------------------
@@ -693,32 +714,6 @@ function path_class(
     return :other
 end
 
-function source_files(map::CoverageMap)::Vector{String}
-    return sort([
-        path for path in keys(map.blobs)
-            if any(startswith(path, string(dir, "/")) for dir in map.sources)
-    ])
-end
-
-"""
-    verify_map(root, map, base)
-
-The map's line numbers belong to the files it was built from. Every file hash it recorded
-must equal the file at `base`, or the lines point at the wrong code.
-"""
-function verify_map(root::AbstractString, map::CoverageMap, base::AbstractString)::Nothing
-    blobs = tree_blobs(root, base)
-    differing = sort([path for (path, hash) in map.blobs if get(blobs, path, "") != hash])
-    if !isempty(differing)
-        error(
-            "the map was built from files that differ from ", base, " in ", length(differing),
-            " tracked file(s), first ", first(differing), ". Rebuild the map at this revision, ",
-            "or drop --base so it diffs against the map's own commit.",
-        )
-    end
-    return nothing
-end
-
 """
     select_testsets(root, map, base, target)
 
@@ -744,7 +739,6 @@ function select_testsets(
     changes = file_changes(root, base, target)
     old_snapshot = Snapshot(String(root), String(base))
     new_snapshot = Snapshot(String(root), String(target))
-    verify_map(root, map, base)
     old_tests = located_items(old_snapshot, map.tests)
     new_tests = located_items(new_snapshot, map.tests)
     test_paths = Set(vcat([map.tests], [located.path for located in vcat(old_tests, new_tests)]))
@@ -762,13 +756,15 @@ function select_testsets(
     test_deltas = [file_delta(old_snapshot, new_snapshot, change) for (change, class) in zip(changes, classes) if class == :test]
     any_jl = any(endswith(change.path, ".jl") for change in changes)
 
-    executed = reduce(
+    changed = reduce(
         vcat,
         (
             [Located(delta.path, item) for item in delta.old_hit if item.kind == :function] for delta in source_deltas
         );
         init = Located[],
     )
+    lacking = [located for located in changed if isempty(mapped_file(map, located.path, located.item))]
+    executed = [located for located in changed if !isempty(mapped_file(map, located.path, located.item))]
     run_reasons = reduce(
         vcat,
         (by_coverage(map, located.path, located.item, "runs changed `" * located.item.name * "`") for located in executed);
@@ -782,11 +778,16 @@ function select_testsets(
     old_sources = reduce(
         vcat,
         (
-            [Located(path, item) for item in items_at(old_snapshot, path, true)] for path in source_files(map)
+            [Located(path, item) for item in items_at(old_snapshot, path, true)] for path in source_files(root, base, map.sources)
         );
         init = Located[],
     )
-    widened = unique(reduce(vcat, (widened_names(delta) for delta in source_deltas); init = String[]))
+    widened = unique(
+        vcat(
+            reduce(vcat, (widened_names(delta) for delta in source_deltas); init = String[]),
+            [located.item.name for located in lacking],
+        ),
+    )
     dispatch_reasons = reduce(
         vcat,
         (
@@ -972,6 +973,33 @@ struct Worker
     sources::Vector{String}
     covered::String
     environment::Vector{Pair{String,String}}
+    spans::Dict{String,Vector{UnitRange{Int}}}
+end
+
+"""
+    executes(sorted, span)
+
+Whether any of the sorted line numbers falls in `span`.
+"""
+function executes(sorted::AbstractVector{Int}, span::UnitRange{Int})::Bool
+    position = searchsortedfirst(sorted, first(span))
+    return position <= length(sorted) && sorted[position] <= last(span)
+end
+
+"""
+    executed_positions(lines, spans)
+
+The positions (as `ranges_text` writes them) of the `spans`, a file's functions in file
+order, that contain an executed line.
+"""
+function executed_positions(lines::AbstractVector{Int}, spans::AbstractVector{UnitRange{Int}})::String
+    sorted = sort(lines)
+    return ranges_text([position for (position, span) in enumerate(spans) if executes(sorted, span)])
+end
+
+"The functions of a source file, in file order."
+function file_functions(snapshot::Snapshot, path::AbstractString)::Vector{Item}
+    return [item for item in items_at(snapshot, path, true) if item.kind == :function]
 end
 
 function (worker::Worker)(name::AbstractString)::Pair{String,Dict{String,Any}}
@@ -1018,7 +1046,9 @@ function (worker::Worker)(name::AbstractString)::Pair{String,Dict{String,Any}}
     return String(name) => Dict{String,Any}(
         "status" => status,
         "ms" => milliseconds,
-        "lines" => Dict{String,Any}(file => ranges_text(covered) for (file, covered) in lines),
+        "functions" => Dict{String,Any}(
+            file => executed_positions(covered, get(worker.spans, file, UnitRange{Int}[])) for (file, covered) in lines
+        ),
     )
 end
 
@@ -1031,13 +1061,14 @@ function jl_files(root::AbstractString, dir::AbstractString)::Vector{String}
 end
 
 """
-    build_map(root, out; tests, sources, runner, jobs, timeout, only, shard, shards)
+    build_map(root, out; tests, sources, runner, jobs, timeout, only, shard, shards, commit, environment)
 
 Run every top-level testset of `tests` (found statically, following literal includes) in its
 own process and write the map to `out`. Testsets are ordered by source length and dealt
 round-robin into `shards` shards; this call runs shard `shard` (`merge` joins the shards'
 maps). The shard's smallest testset runs alone first, so the coverage-flagged
-precompilation finishes before the rest start together.
+precompilation finishes before the rest start together. The map lists the functions of every
+`.jl` file under `sources` (as parsed in `root`) and records, per testset, which ran.
 """
 function build_map(
         root::AbstractString,
@@ -1072,9 +1103,13 @@ function build_map(
     logs = string(out, ".work")
     mkpath(logs)
     covered = realpath(joinpath(root, length(sources) == 1 ? first(sources) : ""))
-    worker = Worker(String(root), String(runner), logs, timeout, String[sources...], covered, environment)
-    results = vcat([worker(first(names))], asyncmap(worker, reverse(names[2:end]); ntasks = jobs))
+    snapshot = Snapshot(String(root), "")
     paths = reduce(vcat, (jl_files(root, dir) for dir in sources); init = String[])
+    functions = Dict(path => file_functions(snapshot, path) for path in paths)
+    definitions = Dict(path => String[item.header for item in items] for (path, items) in functions)
+    line_spans = Dict(path => UnitRange{Int}[item.first:item.last for item in items] for (path, items) in functions)
+    worker = Worker(String(root), String(runner), logs, timeout, String[sources...], covered, environment, line_spans)
+    results = vcat([worker(first(names))], asyncmap(worker, reverse(names[2:end]); ntasks = jobs))
     document = Dict{String,Any}(
         "meta" => Dict{String,Any}(
             "commit" => commit,
@@ -1084,7 +1119,7 @@ function build_map(
             "runner" => String(runner),
             "sources" => String[sources...],
         ),
-        "blobs" => Dict{String,Any}(path => blob_hash(joinpath(root, path)) for path in paths),
+        "definitions" => definitions,
         "testsets" => Dict{String,Any}(results),
     )
     buffer = IOBuffer()
@@ -1102,14 +1137,14 @@ end
     merge_maps(out, inputs)
 
 Join the maps of a sharded build into one. Every shard must come from the same commit and
-the same files; a testset mapped twice is an error.
+list the same definitions; a testset mapped twice is an error.
 """
 function merge_maps(out::AbstractString, inputs::AbstractVector{<:AbstractString})::Nothing
     documents = [TOML.parsefile(input) for input in inputs]
     reference = first(documents)
     for (input, document) in zip(inputs, documents)
         same_meta = all(document["meta"][key] == reference["meta"][key] for key in ("commit", "tests", "runner", "sources"))
-        if !same_meta || document["blobs"] != reference["blobs"]
+        if !same_meta || document["definitions"] != reference["definitions"]
             error(input, " was built from another commit or other files than ", first(inputs))
         end
     end
@@ -1119,7 +1154,7 @@ function merge_maps(out::AbstractString, inputs::AbstractVector{<:AbstractString
     end
     merged = Dict{String,Any}(
         "meta" => reference["meta"],
-        "blobs" => reference["blobs"],
+        "definitions" => reference["definitions"],
         "testsets" => merge((document["testsets"] for document in documents)...),
     )
     buffer = IOBuffer()

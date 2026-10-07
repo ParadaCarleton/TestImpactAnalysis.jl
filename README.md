@@ -38,8 +38,8 @@ Options (`--root` defaults to the current directory, `--map` to `ROOT/test-impac
 ## Build the map
 
 Every top-level testset runs in its own process under `--code-coverage=@<source dir>`.
-The map records which source lines each testset executed, the tree's commit, and the git
-blob hash of every source file. A runner that starts distributed workers would start them
+The map records the tree's commit, every source file's function list, and which functions
+each testset executed. A runner that starts distributed workers would start them
 without the coverage flags: use `--env` to keep each testset in the coverage-flagged process
 (for ReTest-style runners, a variable the runner reads).
 
@@ -81,8 +81,26 @@ rule that chose it, followed by a regex for the runner.
 - A changed function that no testset executed is printed as `UNCOVERED`. So is a new
   function that no testset runs or names.
 - A file that does not parse stops the selector with the parser's message.
-- If a mapped source file at `--base` differs from the file the map was built on, the
-  selector refuses to run, because its line numbers would point at the wrong code.
+- The map never refuses a base. A function at `--base` that the map lacks (added or
+  re-signed since the map was built) is selected by name only; see "What a map knows".
+
+## What a map knows
+
+Coverage is keyed by definition, not by line. The map lists each source file's functions
+by signature header (the signature with its whitespace removed: `g(x::Int)`,
+`(s::S)(y)`), in file order, and a testset's entry names the functions it executed by
+position in that list (`functions = { "src/P.jl" = "1-3,9" }`). A function counts as
+executed when any line from its signature to its `end` ran. Edits elsewhere in a file
+move line numbers but not headers, so a map stays valid while the code around it changes.
+
+- Methods sharing a name are told apart by their headers. If two definitions in one file
+  have the same header (for instance under `@static if`), their coverage is joined.
+- A function that moves to another file is still found, when that header is defined in
+  exactly one other file of the map.
+- A renamed or re-signed function has a new header, so the map lacks it. It is selected
+  like a new function: by the testsets that executed another method of its name and the
+  testsets that mention the name, and printed as `UNCOVERED` when neither exists.
+- Only a rebuild refreshes coverage for new, renamed and rewritten code.
 
 ## Blind spots
 

@@ -1,7 +1,7 @@
 # Self-check of the selector on a throwaway git repository with a hand-written map:
 #     julia --startup-file=no --project=packages/TestImpactAnalysis packages/TestImpactAnalysis/test/runtests.jl
 using Test
-using TestImpactAnalysis: TestImpactAnalysis, blob_hash, lcov_files, merge_maps, parse_ranges, ranges_text, read_map, retest_pattern, select_testsets
+using TestImpactAnalysis: TestImpactAnalysis, executed_positions, lcov_files, merge_maps, parse_ranges, ranges_text, read_map, retest_pattern, select_testsets
 
 const PACKAGE = """
 module P
@@ -61,24 +61,24 @@ function fixture(root::AbstractString)::String
     tests = "test/runtests.jl"
     runner = "test/retest.jl"
     sources = ["src"]
-    [blobs]
-    "src/P.jl" = "$(blob_hash(joinpath(root, "src/P.jl")))"
+    [definitions]
+    "src/P.jl" = ["f(x)", "g(x::Int)", "h(s::S)", "unused(x)"]
     [testsets."runs f"]
     status = "ok"
     ms = 1
-    lines = { "src/P.jl" = "6" }
+    functions = { "src/P.jl" = "1" }
     [testsets."runs g"]
     status = "ok"
     ms = 1
-    lines = { "src/P.jl" = "8" }
+    functions = { "src/P.jl" = "2" }
     [testsets."uses S"]
     status = "ok"
     ms = 1
-    lines = { "src/P.jl" = "10" }
+    functions = { "src/P.jl" = "3" }
     [testsets."helper user"]
     status = "ok"
     ms = 1
-    lines = {}
+    functions = {}
     """
     write_file(root, "map.toml", map)
     write_file(root, ".gitignore", "map.toml\n.gitignore\n")
@@ -144,6 +144,7 @@ end
     root = mktempdir()
     tracefile = "SF:$root/src/a.jl\nDA:1,1\nDA:2,0\nDA:3,4\nend_of_record\nSF:/elsewhere/b.jl\nDA:1,1\nend_of_record\n"
     @test lcov_files(tracefile, root, ["src"]) == Dict("src/a.jl" => [1, 3])
+    @test executed_positions([6, 8, 9], [6:6, 7:9, 10:10]) == "1-2"
 end
 
 function shard_map(commit::AbstractString, testset::AbstractString)::String
@@ -153,12 +154,12 @@ function shard_map(commit::AbstractString, testset::AbstractString)::String
     tests = "test/runtests.jl"
     runner = "test/retest.jl"
     sources = ["src"]
-    [blobs]
-    "src/P.jl" = "abc"
+    [definitions]
+    "src/P.jl" = ["f(x)", "g(x::Int)"]
     [testsets."$testset"]
     status = "ok"
     ms = 1
-    lines = { "src/P.jl" = "6" }
+    functions = { "src/P.jl" = "1" }
     """
 end
 
@@ -172,4 +173,39 @@ end
     @test sort(collect(keys(read_map(joinpath(root, "map.toml")).testsets))) == ["runs f", "runs g"]
     @test_throws "more than one shard" merge_maps(joinpath(root, "map.toml"), [joinpath(root, "two.toml"), joinpath(root, "again.toml")])
     @test_throws "another commit" merge_maps(joinpath(root, "map.toml"), [joinpath(root, "one.toml"), joinpath(root, "other.toml")])
+end
+
+@testset "identity survives an unrelated edit above a covered function" begin
+    root = mktempdir()
+    fixture(root)
+    write_file(root, "src/P.jl", replace(PACKAGE, "f(x) = x + 1" => "extra(x) = x\nf(x) = x + 1"))
+    git_run(root, "commit", "-q", "-a", "-m", "unrelated edit above f")
+    base = strip(git_run(root, "rev-parse", "HEAD"))
+    map = read_map(joinpath(root, "map.toml"))
+    write_file(root, "src/P.jl", replace(read(joinpath(root, "src/P.jl"), String), "x + 1" => "x + 2"))
+    @test names_in(select_testsets(root, map, base, "")) == ["runs f"]
+end
+
+@testset "functions the map lacks and functions that moved" begin
+    root = mktempdir()
+    fixture(root)
+    fresh = selected_after(root, "src/P.jl", "unused(x) = x", "unused(x) = x\nfresh(x) = x")
+    @test isempty(names_in(fresh))
+    @test any(occursin("`fresh`", line) for line in fresh.uncovered)
+
+    write_file(root, "src/P.jl", replace(PACKAGE, "h(s::S) = s.a\n" => "extra(x) = x\n"))
+    write_file(root, "src/Q.jl", "h(s::S) = s.a\n")
+    git_run(root, "add", "-A")
+    git_run(root, "commit", "-q", "-m", "move h to Q.jl, add extra")
+    base = strip(git_run(root, "rev-parse", "HEAD"))
+    map = read_map(joinpath(root, "map.toml"))
+
+    write_file(root, "src/Q.jl", "h(s::S) = s.a + 1\n")
+    @test names_in(select_testsets(root, map, base, "")) == ["uses S"]
+
+    write_file(root, "src/Q.jl", "h(s::S) = s.a\n")
+    write_file(root, "src/P.jl", replace(read(joinpath(root, "src/P.jl"), String), "extra(x) = x" => "extra(x) = 2x"))
+    lacking = select_testsets(root, map, base, "")
+    @test isempty(names_in(lacking))
+    @test any(occursin("`extra`", line) for line in lacking.uncovered)
 end
