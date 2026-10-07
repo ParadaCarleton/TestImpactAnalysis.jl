@@ -76,7 +76,7 @@ testset is printed with the rule that chose it, followed by a regex for the runn
 | a testset | that testset |
 | a test helper or test constant | testsets that mention it, transitively |
 | a non-`.jl` file under the tests directory | testsets whose code or helpers name the file |
-| any `.jl` file | static-analysis testsets: JET, Aqua, `readdir`/`walkdir`/`pkgdir` scans and `names(mod; all = true)` introspection, and their helpers |
+| any `.jl` file | static-analysis testsets: JET, Aqua, `readdir`/`walkdir`/`pkgdir` scans and `names(mod; all = true)` introspection, and testsets using their helpers. A test name counts as such a helper only if every definition of it reads or analyses code or uses such a helper, and it is not one of Base's names: a struct whose constructor method reports through a scanning helper does not make every testset that builds the struct a static-analysis testset. |
 
 - Blank lines, comments and docstrings are ignored. A change counts only if the code
   tokens change.

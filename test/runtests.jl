@@ -241,3 +241,32 @@ end
     @test occursin("selected 1 testsets", explicit)
     @test occursin("map lacks 1 of 2 changed functions", explicit)
 end
+
+@testset "a name is a static-analysis helper only when every definition of it is" begin
+    root = mktempdir()
+    fixture(root)
+    helpers = """
+    scan_sources() = readdir("src")
+    struct Wrapped
+        value::Int
+    end
+    Wrapped(value::Float64) = error("leak: ", scan_sources())
+    """
+    write_file(root, "test/helpers.jl", helpers)
+    tests = replace(TESTS, "using Test\n" => "using Test\ninclude(\"helpers.jl\")\n") * """
+    @testset "scans" begin
+        @test !isempty(scan_sources())
+    end
+    @testset "wraps" begin
+        @test Wrapped(1).value == 1
+    end
+    """
+    write_file(root, "test/runtests.jl", tests)
+    git_run(root, "add", "-A")
+    git_run(root, "commit", "-q", "-m", "helpers")
+    base = strip(git_run(root, "rev-parse", "HEAD"))
+    write_file(root, "src/P.jl", replace(PACKAGE, "unused(x) = x" => "unused(x) = x # note\nother(x) = x"))
+    selection = select_testsets(root, read_map(joinpath(root, "map.toml")), base, "")
+    static = sort([first(pair) for pair in selection.reasons if startswith(last(pair), "static analysis")])
+    @test static == ["scans"]
+end

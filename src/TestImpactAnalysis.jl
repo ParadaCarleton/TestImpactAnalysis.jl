@@ -677,6 +677,37 @@ function name_closure(seeds::Set{String}, binders::AbstractVector{Located})::Set
     return name_closure(grown, binders)
 end
 
+"Whether `item` reads or analyses code itself, or mentions a name that does."
+function static_user(item::Item, names::AbstractSet{String})::Bool
+    return static_item(item) || !isdisjoint(item.mentions, names)
+end
+
+"""
+    static_closure(names, binders)
+
+The names whose use reads or analyses code: `names` plus every name, not one of Base's,
+whose defining items are all static users. A name with one ordinary definition (a struct
+whose constructor method also reports a leak, a helper shared with ordinary tests) stays
+out, so ordinary testsets that use it are not taken for static analysis.
+"""
+function static_closure(names::Set{String}, binders::AbstractVector{Located})::Set{String}
+    candidates = unique(
+        reduce(vcat, (binder.item.keys for binder in binders if static_user(binder.item, names)); init = String[]),
+    )
+    grown = union(
+        names,
+        [
+            name for name in candidates
+                if !isdefined(Base, Symbol(name)) &&
+                all(static_user(binder.item, names) for binder in binders if name in binder.item.keys)
+        ],
+    )
+    if length(grown) == length(names)
+        return names
+    end
+    return static_closure(grown, binders)
+end
+
 function describe_item(path::AbstractString, item::Item)::String
     return string(path, ":", item.first, "-", item.last)
 end
@@ -873,8 +904,7 @@ function select_testsets(
         located.item.name => "new testset, not in the map" for located in new_testsets
             if !haskey(map.testsets, located.item.name)
     ]
-    static_helpers = Set(reduce(vcat, (located.item.keys for located in test_binders if static_item(located.item)); init = String[]))
-    static_names = name_closure(union(static_helpers, STATIC_MARKERS), test_binders)
+    static_names = static_closure(copy(STATIC_MARKERS), test_binders)
     static_reasons = [
         located.item.name => "static analysis: reads or analyses code, a .jl file changed" for located in new_testsets
             if any_jl && (static_item(located.item) || !isdisjoint(located.item.mentions, static_names))
