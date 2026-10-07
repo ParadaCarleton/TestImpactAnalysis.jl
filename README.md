@@ -33,7 +33,7 @@ Options (`--root` defaults to the current directory, `--map` to `ROOT/test-impac
 | `--commit REV` | build | Commit recorded in the map (default `git rev-parse HEAD`) |
 | `--env NAME=VALUE` | build | Environment variable for each testset process; repeatable |
 | `--in MAP` | merge | A shard map; repeatable |
-| `--base REV`, `--to REV` | select, run | Compare `--base` (default the map's commit) with `--to` (default the working tree, untracked files included) |
+| `--base REV`, `--trunk REV`, `--to REV` | select, run | Compare `--base` (default `merge-base(TRUNK, TIP)`, TRUNK default `main`) with `--to` (default the working tree, untracked files included; TIP is then `HEAD`) |
 
 ## Build the map
 
@@ -61,9 +61,11 @@ testimpact.jl merge --map map.toml --in shard-1-map.toml --in shard-2-map.toml .
 
 ## Select
 
-`select` diffs `--base` against the working tree, or against `--to REV`. In a jj workspace
-that is not colocated, pass `--to <commit of @>`. Each selected testset is printed with the
-rule that chose it, followed by a regex for the runner.
+`select` diffs the branch against its own base: `git merge-base TRUNK TIP`, where TIP is
+`--to REV` (default `HEAD`) and TRUNK is `--trunk REV` (default `main`). `--base REV`
+replaces the merge-base. The other side is the working tree, untracked files included, or
+`--to REV`. In a jj workspace that is not colocated, pass `--to <commit of @>`. Each selected
+testset is printed with the rule that chose it, followed by a regex for the runner.
 
 | Change | Selected |
 | --- | --- |
@@ -81,8 +83,10 @@ rule that chose it, followed by a regex for the runner.
 - A changed function that no testset executed is printed as `UNCOVERED`. So is a new
   function that no testset runs or names.
 - A file that does not parse stops the selector with the parser's message.
-- The map never refuses a base. A function at `--base` that the map lacks (added or
-  re-signed since the map was built) is selected by name only; see "What a map knows".
+- The map's commit is not the base, and no base is refused. The map lacks the functions
+  added, renamed or re-signed since it was built; `select` prints how many of the changed
+  functions that is (`map lacks 2 of 9 changed functions`) and lists them. Those are
+  selected by name only (see "What a map knows"). The count says when to rebuild.
 
 ## What a map knows
 

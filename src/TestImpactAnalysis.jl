@@ -530,13 +530,16 @@ end
 """
 The result of a selection: `reasons` pairs a testset name with the rule that selected it,
 `full` lists why the whole suite must run, `uncovered` the changed functions no testset
-executed, and `notes` everything else the reader should know.
+executed, `notes` everything else the reader should know, `changed` how many functions
+the change touched (added ones included) and `lacking` those of them the map does not know.
 """
 struct Selection
     reasons::Vector{Pair{String,String}}
     full::Vector{String}
     uncovered::Vector{String}
     notes::Vector{String}
+    changed::Int
+    lacking::Vector{String}
 end
 
 "The hunks' touched old items and new items."
@@ -544,6 +547,12 @@ struct Delta
     path::String
     old_hit::Vector{Item}
     new_hit::Vector{Item}
+end
+
+"The functions a delta adds: touched new functions whose header no touched old function has."
+function added_functions(delta::Delta)::Vector{Located}
+    old_headers = Set(item.header for item in delta.old_hit if item.kind == :function)
+    return [Located(delta.path, item) for item in delta.new_hit if item.kind == :function && !(item.header in old_headers)]
 end
 
 function in_doc(items::AbstractVector{Item}, number::Integer)::Bool
@@ -749,7 +758,7 @@ function select_testsets(
     full = full_suite_reasons(changes, map.sources)
     if !isempty(full)
         everything = [name => "full suite: " * reason for name in sort(collect(runnable)) for reason in full]
-        return Selection(everything, full, String[], String[])
+        return Selection(everything, full, String[], String[], 0, String[])
     end
 
     source_deltas = [file_delta(old_snapshot, new_snapshot, change) for (change, class) in zip(changes, classes) if class == :source]
@@ -765,6 +774,9 @@ function select_testsets(
     )
     lacking = [located for located in changed if isempty(mapped_file(map, located.path, located.item))]
     executed = [located for located in changed if !isempty(mapped_file(map, located.path, located.item))]
+    added = reduce(vcat, (added_functions(delta) for delta in source_deltas); init = Located[])
+    absent = vcat(lacking, [located for located in added if isempty(mapped_file(map, located.path, located.item))])
+    absent_lines = [string("`", located.item.name, "` (", describe_item(located.path, located.item), ")") for located in absent]
     run_reasons = reduce(
         vcat,
         (by_coverage(map, located.path, located.item, "runs changed `" * located.item.name * "`") for located in executed);
@@ -872,7 +884,7 @@ function select_testsets(
     reasons = [pair for pair in every if first(pair) in runnable]
     weak = sort([name for (name, entry) in map.testsets if entry.status != "ok"])
     notes = [string("map testset `", name, "` has status ", map.testsets[name].status, ": its coverage may be partial") for name in weak]
-    return Selection(reasons, String[], vcat(uncovered, unreached_lines), notes)
+    return Selection(reasons, String[], vcat(uncovered, unreached_lines), notes, length(changed) + length(added), absent_lines)
 end
 
 """
@@ -891,6 +903,10 @@ function report(io::IO, map::CoverageMap, selection::Selection, base::AbstractSt
     println(io, "map commit ", first(map.commit, 12), " (", length(map.testsets), " testsets); diff ", first(base, 12), " -> ", isempty(target) ? "working tree" : first(target, 12))
     for reason in selection.full
         println(io, "FULL SUITE: ", reason)
+    end
+    println(io, "map lacks ", length(selection.lacking), " of ", selection.changed, " changed functions")
+    for line in selection.lacking
+        println(io, "  not in map: ", line)
     end
     for line in selection.uncovered
         println(io, "UNCOVERED: ", line)
@@ -1190,7 +1206,7 @@ usage: testimpact.jl COMMAND [options]
           [--runner test/runtests.jl] [--jobs N] [--timeout SECONDS] [--only SUBSTRING]...
           [--shard K/N] [--commit REV] [--env NAME=VALUE]...
   merge   [--map MAP] --in SHARD_MAP --in SHARD_MAP ...
-  select  [--map MAP] [--root DIR] [--base REV] [--to REV]
+  select  [--map MAP] [--root DIR] [--base REV] [--trunk REV] [--to REV]
   run     the options of select; runs the selected testsets through the map's runner
 --root defaults to the current directory and MAP to ROOT/test-impact-map.toml.
 """
@@ -1248,9 +1264,8 @@ function select_command(
         run_selected::Bool,
     )::Nothing
     map = read_map(map_path)
-    base = strip(git(root, "rev-parse", "--verify", map.commit * "^{commit}"))
-    base = option_value(args, "--base", base)
     target = option_value(args, "--to", "")
+    tip = "HEAD"
     if isempty(target)
         toplevel = realpath(strip(git(root, "rev-parse", "--show-toplevel")))
         if toplevel != realpath(root)
@@ -1258,7 +1273,17 @@ function select_command(
         end
     else
         target = strip(git(root, "rev-parse", "--verify", target * "^{commit}"))
+        tip = target
     end
+    trunk = option_value(args, "--trunk", "main")
+    bases = option_values(args, "--base")
+    base = ""
+    if isempty(bases)
+        base = strip(git(root, "merge-base", trunk, tip))
+    else
+        base = last(bases)
+    end
+    base = strip(git(root, "rev-parse", "--verify", base * "^{commit}"))
     selection = select_testsets(root, map, String(base), String(target))
     report(stdout, map, selection, base, target)
     names = sort(unique(first.(selection.reasons)))

@@ -209,3 +209,35 @@ end
     @test isempty(names_in(lacking))
     @test any(occursin("`extra`", line) for line in lacking.uncovered)
 end
+
+"The text `main(args)` prints to stdout."
+function printed_by_main(args::AbstractVector{<:AbstractString})::String
+    path = tempname()
+    open(path, "w") do io
+        redirect_stdout(io) do
+            TestImpactAnalysis.main(args)
+        end
+    end
+    return read(path, String)
+end
+
+@testset "select diffs against the merge-base with the trunk" begin
+    root = mktempdir()
+    first_commit = fixture(root)
+    git_run(root, "branch", "-M", "trunk")
+    write_file(root, "src/P.jl", replace(PACKAGE, "f(x) = x + 1" => "extra(x) = x\nf(x) = x + 1"))
+    git_run(root, "commit", "-q", "-a", "-m", "trunk moves on")
+    git_run(root, "checkout", "-q", "-b", "topic", first_commit)
+    write_file(root, "src/P.jl", replace(PACKAGE, "x + 1" => "x + 2"))
+    git_run(root, "commit", "-q", "-a", "-m", "topic edits f")
+    arguments = ["select", "--root", root, "--map", joinpath(root, "map.toml"), "--trunk", "trunk", "--to", "topic"]
+
+    text = printed_by_main(arguments)
+    @test occursin("diff $(first(first_commit, 12)) ->", text)
+    @test occursin("selected 1 testsets\n  runs f  <- runs changed `f`", text)
+    @test occursin("map lacks 0 of 1 changed functions", text)
+
+    explicit = printed_by_main(vcat(arguments, ["--base", "trunk"]))
+    @test occursin("selected 1 testsets", explicit)
+    @test occursin("map lacks 1 of 2 changed functions", explicit)
+end
