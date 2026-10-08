@@ -64,14 +64,22 @@ function last_line(node::JS.SyntaxNode)::Int
 end
 
 """
+Leaf kinds that name a macro in Julia 1.12's JuliaSyntax (`MacroName` holds `testset` for
+`@testset`). Julia 1.13 parses a macro name as an `Identifier`, and lacks these kinds, so
+they are compared by name.
+"""
+const MACRO_NAME_KINDS = ("MacroName", "StringMacroName", "CmdMacroName")
+
+"""
     identifier_texts(node)
 
 Every identifier and macro name below `node`, without the `@` of a macro.
 """
 function identifier_texts(node::JS.SyntaxNode)::Vector{String}
     if JS.is_leaf(node)
-        if JS.kind(node) == K"Identifier"
-            return [String(JS.sourcetext(node))]
+        kind = JS.kind(node)
+        if kind == K"Identifier" || string(kind) in MACRO_NAME_KINDS
+            return [String(lstrip(JS.sourcetext(node), '@'))]
         end
         return String[]
     end
@@ -164,7 +172,7 @@ end
 function testset_nodes(node::JS.SyntaxNode)::Vector{JS.SyntaxNode}
     if JS.kind(node) == K"macrocall"
         parts = JS.children(node)
-        if String(JS.sourcetext(first(parts))) == "@testset"
+        if lstrip(String(JS.sourcetext(first(parts))), '@') == "testset"
             return [node]
         end
         return reduce(vcat, (testset_nodes(part) for part in parts); init = JS.SyntaxNode[])

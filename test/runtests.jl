@@ -270,3 +270,9 @@ end
     static = sort([first(pair) for pair in selection.reasons if startswith(last(pair), "static analysis")])
     @test static == ["scans"]
 end
+
+@testset "macro names are identifiers on every supported Julia" begin
+    items = TestImpactAnalysis.source_items("@testset \"t\" begin\n    @check x\nend\n", "macros.jl")
+    @test only(items).kind == :testset
+    @test "check" in only(items).mentions
+end
