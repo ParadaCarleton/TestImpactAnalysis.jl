@@ -1,5 +1,5 @@
 # Self-check of the selector on a throwaway git repository with a hand-written map:
-#     julia --startup-file=no --project=packages/TestImpactAnalysis packages/TestImpactAnalysis/test/runtests.jl
+#     julia --startup-file=no --project=. -e 'using Pkg; Pkg.test()'   (from the package's directory)
 using Test
 using TestImpactAnalysis: TestImpactAnalysis, executed_positions, lcov_files, merge_maps, parse_ranges, ranges_text, read_map, retest_pattern, select_testsets
 

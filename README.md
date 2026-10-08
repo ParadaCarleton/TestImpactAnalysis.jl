@@ -1,4 +1,6 @@
-# TestImpactAnalysis
+# TestImpactAnalysis.jl
+
+[![CI](https://github.com/ParadaCarleton/TestImpactAnalysis.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/ParadaCarleton/TestImpactAnalysis.jl/actions/workflows/CI.yml)
 
 Test impact analysis (regression test selection) for Julia packages: after an edit, run
 only the testsets the edit can affect. It uses only the standard library and never loads
@@ -8,9 +10,30 @@ It expects a test entry file (default `test/runtests.jl`) that holds top-level `
 with literal names, and a runner script (default `test/runtests.jl`) that runs the testsets
 whose name matches a regex given as its first argument, as ReTest does.
 
+## Usage
+
+Install it into an environment of its own, so it never touches the package under test:
+
 ```
-julia --startup-file=no packages/TestImpactAnalysis/bin/testimpact.jl COMMAND [options]
+julia --project=tia -e 'using Pkg; Pkg.add(url = "https://github.com/ParadaCarleton/TestImpactAnalysis.jl")'
 ```
+
+Then run a command from the root of the package whose tests you want to select:
+
+```
+julia --startup-file=no --project=tia -e 'using TestImpactAnalysis; main(ARGS)' COMMAND [options]
+```
+
+From a clone, `julia --startup-file=no bin/testimpact.jl COMMAND [options]` does the same.
+A typical session maps the suite once, then selects for each branch:
+
+```
+testimpact build --source src --jobs 8        # writes test-impact-map.toml
+testimpact select --trunk main                # testsets this branch can affect
+testimpact run --trunk main                   # select, then run them
+```
+
+(`testimpact` standing for either command line above.)
 
 | Command | What it does |
 | --- | --- |
@@ -125,6 +148,8 @@ move line numbers but not headers, so a map stays valid while the code around it
 
 ## Tests
 
+From the package's directory:
+
 ```
-julia --startup-file=no --project=packages/TestImpactAnalysis packages/TestImpactAnalysis/test/runtests.jl
+julia --startup-file=no --project=. -e 'using Pkg; Pkg.test()'
 ```
