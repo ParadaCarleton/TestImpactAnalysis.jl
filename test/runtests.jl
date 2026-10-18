@@ -1,7 +1,7 @@
 # Self-check of the selector on a throwaway git repository with a hand-written map:
 #     julia --startup-file=no --project=. -e 'using Pkg; Pkg.test()'   (from the package's directory)
 using Test
-using TestImpactAnalysis: TestImpactAnalysis, executed_positions, lcov_files, merge_maps, parse_ranges, ranges_text, read_map, retest_pattern, select_testsets
+using TestImpactAnalysis: TestImpactAnalysis, executed_positions, lcov_files, merge_maps, parse_ranges, ranges_text, read_map, retest_pattern, runner_arguments, select_testsets
 
 const PACKAGE = """
 module P
@@ -187,6 +187,10 @@ end
     @test sort(collect(keys(read_map(joinpath(root, "map.toml")).testsets))) == ["runs f", "runs g"]
     @test_throws "more than one shard" merge_maps(joinpath(root, "map.toml"), [joinpath(root, "two.toml"), joinpath(root, "again.toml")])
     @test_throws "another commit" merge_maps(joinpath(root, "map.toml"), [joinpath(root, "one.toml"), joinpath(root, "other.toml")])
+    @test read_map(joinpath(root, "one.toml")).project == "."
+    write(joinpath(root, "nested.toml"), replace(shard_map("c0ffee", "uses S"), "[definitions]" => "project = \"test\"\n[definitions]"))
+    @test read_map(joinpath(root, "nested.toml")).project == "test"
+    @test_throws "other files" merge_maps(joinpath(root, "map.toml"), [joinpath(root, "one.toml"), joinpath(root, "nested.toml")])
 end
 
 @testset "identity survives an unrelated edit above a covered function" begin
@@ -289,4 +293,82 @@ end
     items = TestImpactAnalysis.source_items("@testset \"t\" begin\n    @check x\nend\n", "macros.jl")
     @test only(items).kind == :testset
     @test "check" in only(items).mentions
+end
+
+"A repository whose test files are suites of their own, and a map built from it with `--suites test`."
+function suite_fixture(root::AbstractString)::String
+    git_run(root, "init", "-q")
+    write_file(root, "Project.toml", "name = \"P\"\n")
+    write_file(root, "src/P.jl", PACKAGE)
+    write_file(root, "test/runtests.jl", "for suite in ARGS\n    include(suite)\nend\n")
+    write_file(root, "test/support/helper.jl", "helper() = 1\n")
+    write_file(root, "test/a/test_f.jl", "using Test\n@testset \"f\" begin\n    @test P.f(1) == 2\nend\n")
+    write_file(root, "test/test_g.jl", "using Test\ninclude(\"support/helper.jl\")\n@testset \"g\" begin\n    @test P.g(helper()) == 2\nend\n")
+    git_run(root, "add", "-A")
+    git_run(root, "commit", "-q", "-m", "base")
+    commit = strip(git_run(root, "rev-parse", "HEAD"))
+    map = """
+    [meta]
+    commit = "$commit"
+    tests = "test/runtests.jl"
+    runner = "test/runtests.jl"
+    suites = "test"
+    suite_pattern = '^test_.*\\.jl\$'
+    sources = ["src"]
+    [definitions]
+    "src/P.jl" = ["f(x)", "g(x::Int)", "h(s::S)", "unused(x)"]
+    [testsets."a/test_f.jl"]
+    status = "ok"
+    ms = 1
+    functions = { "src/P.jl" = "1" }
+    [testsets."test_g.jl"]
+    status = "ok"
+    ms = 1
+    functions = { "src/P.jl" = "2" }
+    """
+    write_file(root, "map.toml", map)
+    write_file(root, ".gitignore", "map.toml\n.gitignore\n")
+    return commit
+end
+
+@testset "suite files are testsets, run by path" begin
+    root = mktempdir()
+    suite_fixture(root)
+    @test read_map(joinpath(root, "map.toml")).suites == "test"
+
+    @test names_in(selected_after(root, "src/P.jl", "x + 1", "x + 2")) == ["a/test_f.jl"]
+    @test names_in(selected_after(root, "src/P.jl", "return 2x", "return 3x")) == ["test_g.jl"]
+
+    edited = selected_after(root, "test/a/test_f.jl", "P.f(1) == 2", "P.f(2) == 3")
+    @test names_in(edited) == ["a/test_f.jl"]
+    @test any(occursin("edited suite", last(pair)) for pair in edited.reasons)
+    @test isempty(names_in(selected_after(root, "test/a/test_f.jl", "using Test\n", "using Test # note\n")))
+
+    @test names_in(selected_after(root, "test/support/helper.jl", "helper() = 1", "helper() = 2")) == ["test_g.jl"]
+
+    write_file(root, "test/test_new.jl", "@testset \"new\" begin\nend\n")
+    write_file(root, "test/not_a_suite.jl", "x = 1\n")
+    map = read_map(joinpath(root, "map.toml"))
+    fresh = select_testsets(root, map, map.commit, "")
+    @test names_in(fresh) == ["test_new.jl"]
+    rm(joinpath(root, "test/test_new.jl"))
+    rm(joinpath(root, "test/not_a_suite.jl"))
+
+    runner = selected_after(root, "test/runtests.jl", "include(suite)", "include(joinpath(@__DIR__, suite))")
+    @test names_in(runner) == ["a/test_f.jl", "test_g.jl"]
+    @test !isempty(runner.full)
+
+    @test runner_arguments(true, ["a/test_f.jl", "test_g.jl"]) == ["a/test_f.jl", "test_g.jl"]
+    @test runner_arguments(false, ["x"]) == [retest_pattern(["x"])]
+end
+
+@testset "environment files of the package and the runner's project select the full suite" begin
+    dependency_file = TestImpactAnalysis.dependency_file
+    @test dependency_file("Project.toml", ["src"], ".")
+    @test dependency_file("Manifest-v1.12.toml", ["src"], ".")
+    @test dependency_file("pkg/Project.toml", ["pkg/src"], ".")
+    @test dependency_file("pkg/test/Project.toml", ["pkg/src"], "pkg/test")
+    @test !dependency_file("pkg/docs/Project.toml", ["pkg/src"], "pkg/test")
+    @test !dependency_file("pkg/test/Project.toml", ["pkg/src"], ".")
+    @test !dependency_file("pkg/src/data.toml", ["pkg/src"], ".")
 end

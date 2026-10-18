@@ -3,7 +3,8 @@
 
 Test impact analysis (regression test selection): run only the tests a change can affect.
 Works for any Julia package whose testsets can be run by name through a runner script that
-takes a regex (ReTest's convention).
+takes a regex (ReTest's convention), or whose test files are suites of their own that a
+runner script runs by path (`--suites`).
 
   build   run every top-level testset in its own process with `--code-coverage` and save
           which source lines each one executed, with the git commit of the tree
@@ -318,6 +319,15 @@ function label(snapshot::Snapshot, path::AbstractString)::String
     return string(first(snapshot.revision, 10), ":", path)
 end
 
+"""
+    slashed(path)
+
+`path` with the platform's separator replaced by `/`, the separator of map keys, git paths
+and test paths. `normpath`, `relpath` and coverage tracefiles use the platform's (`\\` on
+Windows); where that is already `/` this changes nothing.
+"""
+slashed(path::AbstractString)::String = replace(path, Base.Filesystem.path_separator => "/")
+
 "The items of `path` at `snapshot`, followed by the items of each file it includes, recursively."
 function located_items(snapshot::Snapshot, path::AbstractString)::Vector{Located}
     items = source_items(read_file(snapshot, path), label(snapshot, path))
@@ -325,8 +335,78 @@ function located_items(snapshot::Snapshot, path::AbstractString)::Vector{Located
 end
 
 function included_items(snapshot::Snapshot, path::AbstractString, item::Item)::Vector{Located}
-    nested = (located_items(snapshot, normpath(joinpath(dirname(path), file))) for file in item.includes)
+    nested = (located_items(snapshot, slashed(normpath(joinpath(dirname(path), file)))) for file in item.includes)
     return vcat([Located(String(path), item)], reduce(vcat, nested; init = Located[]))
+end
+
+"""
+Default `--suite-pattern`: a file under the suites directory is a suite when its name starts
+with `test_`.
+"""
+const DEFAULT_SUITE_PATTERN = raw"^test_.*\.jl$"
+
+"""
+    suite_paths(snapshot, dir, pattern)
+
+The files under `dir` whose name matches `pattern`, as `/`-separated paths from the root: the
+tracked files at a revision, every file in the working tree.
+"""
+function suite_paths(snapshot::Snapshot, dir::AbstractString, pattern::AbstractString)::Vector{String}
+    if isempty(snapshot.revision)
+        found = [
+            replace(relpath(joinpath(folder, file), snapshot.root), '\\' => '/') for
+                (folder, _, files) in walkdir(joinpath(snapshot.root, dir)) for file in files
+        ]
+    else
+        found = collect(keys(tree_blobs(snapshot.root, snapshot.revision)))
+    end
+    return sort([path for path in found if startswith(path, string(dir, "/")) && occursin(Regex(pattern), basename(path))])
+end
+
+"""
+    suite_items(snapshot, dir, pattern)
+
+One `:testset` item per suite file under `dir`, named by its path from `dir` and spanning the
+whole file, followed by the items of the files it includes, recursively.
+"""
+function suite_items(snapshot::Snapshot, dir::AbstractString, pattern::AbstractString)::Vector{Located}
+    return reduce(vcat, (suite_file_items(snapshot, dir, path) for path in suite_paths(snapshot, dir, pattern)); init = Located[])
+end
+
+function suite_file_items(snapshot::Snapshot, dir::AbstractString, path::AbstractString)::Vector{Located}
+    text = read_file(snapshot, path)
+    items = source_items(text, label(snapshot, path))
+    name = relpath_slash(path, dir)
+    suite = Item(
+        :testset,
+        name,
+        [name],
+        1,
+        max(1, count(==('\n'), text)),
+        0,
+        -1,
+        reduce(union, (item.mentions for item in items); init = Set{String}()),
+        unique(reduce(vcat, (item.includes for item in items); init = String[])),
+        "",
+        text,
+    )
+    return included_items(snapshot, path, suite)
+end
+
+"`path` relative to directory `dir`, both `/`-separated paths from the root."
+relpath_slash(path::AbstractString, dir::AbstractString)::String = String(chopprefix(path, string(dir, "/")))
+
+"""
+    test_items(snapshot, tests, suites, suite_pattern)
+
+The test items the map knows: the suites under `suites` when it is set, else the items of the
+entry file `tests` and the files it includes.
+"""
+function test_items(snapshot::Snapshot, tests::AbstractString, suites::AbstractString, suite_pattern::AbstractString)::Vector{Located}
+    if isempty(suites)
+        return located_items(snapshot, tests)
+    end
+    return suite_items(snapshot, suites, suite_pattern)
 end
 
 struct Hunk
@@ -436,7 +516,10 @@ end
 
 """
 A coverage map. `definitions` lists each source file's function headers at `commit`, in
-file order, and a testset's coverage names functions by their position in that list. A
+file order, and a testset's coverage names functions by their position in that list.
+`project` is the Julia project the runner runs in, relative to the root.
+`suites` is the directory whose files matching `suite_pattern` are the testsets (empty when
+the testsets are the `@testset`s of `tests`). A
 function is known by its file and its signature header without whitespace, so methods
 sharing a name are told apart by their arguments, and an edit elsewhere in the file
 leaves the identity alone.
@@ -446,6 +529,9 @@ struct CoverageMap
     tests::String
     sources::Vector{String}
     runner::String
+    project::String
+    suites::String
+    suite_pattern::String
     definitions::Dict{String,Vector{String}}
     testsets::Dict{String,TestsetCoverage}
 end
@@ -492,7 +578,11 @@ function read_map(path::AbstractString)::CoverageMap
                 Dict(String(file) => headers_at(definitions[file], positions) for (file, positions) in entry["functions"]),
             ) for (name, entry) in document["testsets"]
     )
-    return CoverageMap(meta["commit"], meta["tests"], String[meta["sources"]...], meta["runner"], definitions, testsets)
+    # Maps from before `--project` ran the runner in the root's project.
+    project = get(meta, "project", ".")
+    suites = get(meta, "suites", "")
+    suite_pattern = get(meta, "suite_pattern", DEFAULT_SUITE_PATTERN)
+    return CoverageMap(meta["commit"], meta["tests"], String[meta["sources"]...], meta["runner"], project, suites, suite_pattern, definitions, testsets)
 end
 
 """
@@ -744,14 +834,26 @@ function by_coverage(
     return [name => string(rule, " (", describe_item(path, item), ")") for name in covering(map, path, item)]
 end
 
-function full_suite_reasons(changes::AbstractVector{FileChange}, sources::AbstractVector{<:AbstractString})::Vector{String}
-    return [string(change.path, " changed") for change in changes if dependency_file(change.path, sources)]
+function full_suite_reasons(
+        changes::AbstractVector{FileChange},
+        sources::AbstractVector{<:AbstractString},
+        project::AbstractString,
+    )::Vector{String}
+    return [string(change.path, " changed") for change in changes if dependency_file(change.path, sources, project)]
 end
 
-function dependency_file(path::AbstractString, sources::AbstractVector{<:AbstractString})::Bool
+"""
+    dependency_file(path, sources, project)
+
+Whether `path` is a `Project.toml` or `Manifest*.toml` that decides the environment: in the
+root, in or under a source directory, in the package holding a source directory (`pkg/` for
+`pkg/src`), or in the runner's `project` directory.
+"""
+function dependency_file(path::AbstractString, sources::AbstractVector{<:AbstractString}, project::AbstractString)::Bool
     name = basename(path)
     named = name == "Project.toml" || (startswith(name, "Manifest") && endswith(name, ".toml"))
-    placed = !occursin('/', path) || any(startswith(path, string(dir, "/")) for dir in sources)
+    folders = Set(vcat([""], [dirname(dir) for dir in sources], [project == "." ? "" : rstrip(project, '/')]))
+    placed = dirname(path) in folders || any(startswith(path, string(dir, "/")) for dir in sources)
     return named && placed
 end
 
@@ -782,7 +884,7 @@ end
 Select the map's testsets affected by the change from revision `base` to `target` (the
 working tree when `target` is empty). Rules, in the order they appear in the reasons:
 
-  * full suite: a `Project.toml` or `Manifest.toml` changed
+  * full suite: a `Project.toml` or `Manifest.toml` changed, or with `suites` the runner
   * runs changed code: the testset executed a line of a function whose body changed
   * dispatch: a function's signatures were added, removed or edited, so any testset that ran
     any method of that name may now dispatch differently
@@ -801,14 +903,18 @@ function select_testsets(
     changes = file_changes(root, base, target)
     old_snapshot = Snapshot(String(root), String(base))
     new_snapshot = Snapshot(String(root), String(target))
-    old_tests = located_items(old_snapshot, map.tests)
-    new_tests = located_items(new_snapshot, map.tests)
+    old_tests = test_items(old_snapshot, map.tests, map.suites, map.suite_pattern)
+    new_tests = test_items(new_snapshot, map.tests, map.suites, map.suite_pattern)
     test_paths = Set(vcat([map.tests], [located.path for located in vcat(old_tests, new_tests)]))
-    test_dir = dirname(map.tests)
+    test_dir = isempty(map.suites) ? dirname(map.tests) : map.suites
     classes = [path_class(change.path, test_paths, test_dir, map.sources) for change in changes]
     runnable = Set(located.item.name for located in new_tests if located.item.kind == :testset)
 
-    full = full_suite_reasons(changes, map.sources)
+    full = full_suite_reasons(changes, map.sources, map.project)
+    if !isempty(map.suites)
+        # The runner decides how every suite runs.
+        append!(full, [string(change.path, " changed: the runner runs every suite") for change in changes if change.path == map.runner])
+    end
     if !isempty(full)
         everything = [name => "full suite: " * reason for name in sort(collect(runnable)) for reason in full]
         return Selection(everything, full, String[], String[], 0, String[])
@@ -884,6 +990,16 @@ function select_testsets(
         item.name => string("edited testset (", describe_item(delta.path, item), ")") for delta in test_deltas for
             item in delta.new_hit if item.kind == :testset
     ]
+    if !isempty(map.suites)
+        # A suite is its whole file: any code change in it edits the suite.
+        append!(
+            edited,
+            [
+                located.item.name => string("edited suite (", located.path, ")") for located in new_testsets for delta in test_deltas
+                    if delta.path == located.path && !isempty(vcat(delta.old_hit, delta.new_hit))
+            ],
+        )
+    end
     helper_seeds = Set(
         reduce(
             vcat,
@@ -950,6 +1066,19 @@ function retest_pattern(names::AbstractVector{<:AbstractString})::String
     return string("^/(", join(("\\Q" * name * "\\E" for name in names), '|'), ")(/|\$)")
 end
 
+"""
+    runner_arguments(by_path, names)
+
+The runner's arguments selecting the testsets `names`: the suite paths themselves when the
+testsets are suite files (`by_path`), else one ReTest regex.
+"""
+function runner_arguments(by_path::Bool, names::AbstractVector{<:AbstractString})::Vector{String}
+    if by_path
+        return String[names...]
+    end
+    return [retest_pattern(names)]
+end
+
 function report(io::IO, map::CoverageMap, selection::Selection, base::AbstractString, target::AbstractString)::Nothing
     names = sort(unique(first.(selection.reasons)))
     println(io, "map commit ", first(map.commit, 12), " (", length(map.testsets), " testsets); diff ", first(base, 12), " -> ", isempty(target) ? "working tree" : first(target, 12))
@@ -980,9 +1109,10 @@ end
 # ---------------------------------------------------------------------------------------
 
 function relative_path(root::AbstractString, file::AbstractString)::String
-    for prefix in (root, realpath(root))
-        if startswith(file, string(prefix, "/"))
-            return relpath(file, prefix)
+    path = slashed(file)
+    for prefix in slashed.((root, realpath(root)))
+        if startswith(path, string(prefix, "/"))
+            return String(chopprefix(path, string(prefix, "/")))
         end
     end
     return ""
@@ -1028,14 +1158,17 @@ end
 (exited::Exited)()::Bool = !Base.process_running(exited.process)
 
 """
-One testset's coverage run: a fresh Julia process running `runner` on the testset's name
-with an LCOV tracefile of its own, counting lines only under `covered` (an `@path`
-selector, so dependencies keep their package images). Julia 1.13 matches the selector
+One testset's coverage run: a fresh Julia process running `runner` in `project` on the
+testset's name (its path when `by_path`, else a ReTest regex) with an LCOV tracefile of its
+own, counting lines only under `covered` (an `@path` selector, so dependencies keep their
+package images). Julia 1.13 matches the selector
 against real paths: a path through a symlink counts nothing.
 """
 struct Worker
     root::String
     runner::String
+    project::String
+    by_path::Bool
     logs::String
     timeout::Int
     sources::Vector{String}
@@ -1079,7 +1212,7 @@ function (worker::Worker)(name::AbstractString)::Pair{String,Dict{String,Any}}
     # coverage-flagged process: distributed workers would start without the coverage flags).
     command = addenv(
         Cmd(
-            `$(Base.julia_cmd()) --project=$(worker.root) --startup-file=no --threads=2 --code-coverage=@$(worker.covered) --code-coverage=$info $(joinpath(worker.root, worker.runner)) $(retest_pattern([name]))`;
+            `$(Base.julia_cmd()) --project=$(joinpath(worker.root, worker.project)) --startup-file=no --threads=2 --code-coverage=@$(worker.covered) --code-coverage=$info $(joinpath(worker.root, worker.runner)) $(runner_arguments(worker.by_path, [name]))`;
             dir = worker.root,
         ),
         worker.environment...,
@@ -1122,17 +1255,19 @@ end
 
 function jl_files(root::AbstractString, dir::AbstractString)::Vector{String}
     found = [
-        relpath(joinpath(folder, file), root) for (folder, _, files) in walkdir(joinpath(root, dir))
+        slashed(relpath(joinpath(folder, file), root)) for (folder, _, files) in walkdir(joinpath(root, dir))
             for file in files if endswith(file, ".jl")
     ]
     return sort(found)
 end
 
 """
-    build_map(root, out; tests, sources, runner, jobs, timeout, only, shard, shards, commit, environment)
+    build_map(root, out; tests, suites, suite_pattern, sources, runner, project, jobs, timeout, only, shard, shards, commit, environment)
 
-Run every top-level testset of `tests` (found statically, following literal includes) in its
-own process and write the map to `out`. Testsets are ordered by source length and dealt
+Run every top-level testset of `tests` (found statically, following literal includes), or
+with `suites` every file under that directory whose name matches `suite_pattern`, in its
+own process, running `runner` in the Julia project `project` (relative to `root`), and write
+the map to `out`. Testsets are ordered by source length and dealt
 round-robin into `shards` shards; this call runs shard `shard` (`merge` joins the shards'
 maps). The shard's smallest testset runs alone first, so the coverage-flagged
 precompilation finishes before the rest start together. The map lists the functions of every
@@ -1142,8 +1277,11 @@ function build_map(
         root::AbstractString,
         out::AbstractString;
         tests::AbstractString,
+        suites::AbstractString,
+        suite_pattern::AbstractString,
         sources::AbstractVector{<:AbstractString},
         runner::AbstractString,
+        project::AbstractString,
         jobs::Integer,
         timeout::Integer,
         only::AbstractVector{<:AbstractString},
@@ -1152,7 +1290,7 @@ function build_map(
         commit::AbstractString,
         environment::AbstractVector{Pair{String,String}},
     )::Nothing
-    located = located_items(Snapshot(String(root), ""), tests)
+    located = test_items(Snapshot(String(root), ""), tests, suites, suite_pattern)
     testsets = [entry for entry in located if entry.item.kind == :testset]
     dynamic = [describe_item(entry.path, entry.item) for entry in testsets if isempty(entry.item.name)]
     if !isempty(dynamic)
@@ -1176,7 +1314,7 @@ function build_map(
     functions = Dict(path => file_functions(snapshot, path) for path in paths)
     definitions = Dict(path => String[item.header for item in items] for (path, items) in functions)
     line_spans = Dict(path => UnitRange{Int}[item.first:item.last for item in items] for (path, items) in functions)
-    worker = Worker(String(root), String(runner), logs, timeout, String[sources...], covered, environment, line_spans)
+    worker = Worker(String(root), String(runner), String(project), !isempty(suites), logs, timeout, String[sources...], covered, environment, line_spans)
     results = vcat([worker(first(names))], asyncmap(worker, reverse(names[2:end]); ntasks = jobs))
     document = Dict{String,Any}(
         "meta" => Dict{String,Any}(
@@ -1185,6 +1323,9 @@ function build_map(
             "julia" => string(VERSION),
             "tests" => String(tests),
             "runner" => String(runner),
+            "project" => String(project),
+            "suites" => String(suites),
+            "suite_pattern" => String(suite_pattern),
             "sources" => String[sources...],
         ),
         "definitions" => definitions,
@@ -1211,7 +1352,10 @@ function merge_maps(out::AbstractString, inputs::AbstractVector{<:AbstractString
     documents = [TOML.parsefile(input) for input in inputs]
     reference = first(documents)
     for (input, document) in zip(inputs, documents)
-        same_meta = all(document["meta"][key] == reference["meta"][key] for key in ("commit", "tests", "runner", "sources"))
+        same_meta = all(
+            get(document["meta"], key, nothing) == get(reference["meta"], key, nothing) for
+                key in ("commit", "tests", "runner", "project", "suites", "suite_pattern", "sources")
+        )
         if !same_meta || document["definitions"] != reference["definitions"]
             error(input, " was built from another commit or other files than ", first(inputs))
         end
@@ -1254,12 +1398,14 @@ end
 
 const USAGE = """
 usage: testimpact.jl COMMAND [options]
-  build   [--map MAP] [--root DIR] [--tests test/runtests.jl] [--source src]...
-          [--runner test/runtests.jl] [--jobs N] [--timeout SECONDS] [--only SUBSTRING]...
+  build   [--map MAP] [--root DIR] [--tests test/runtests.jl] [--suites DIR]
+          [--suite-pattern REGEX] [--source src]...
+          [--runner test/runtests.jl] [--project .] [--jobs N] [--timeout SECONDS] [--only SUBSTRING]...
           [--shard K/N] [--commit REV] [--env NAME=VALUE]...
   merge   [--map MAP] --in SHARD_MAP --in SHARD_MAP ...
   select  [--map MAP] [--root DIR] [--base REV] [--trunk REV] [--to REV]
-  run     the options of select; runs the selected testsets through the map's runner
+  run     the options of select; runs the selected testsets through the map's runner,
+          in the map's project
 --root defaults to the current directory and MAP to ROOT/test-impact-map.toml.
 """
 
@@ -1293,8 +1439,11 @@ function main(args::AbstractVector{<:AbstractString})::Nothing
             root,
             map_path;
             tests = option_value(args, "--tests", "test/runtests.jl"),
+            suites = rstrip(option_value(args, "--suites", ""), '/'),
+            suite_pattern = option_value(args, "--suite-pattern", DEFAULT_SUITE_PATTERN),
             sources = sources,
             runner = option_value(args, "--runner", "test/runtests.jl"),
+            project = option_value(args, "--project", "."),
             jobs = parse(Int, option_value(args, "--jobs", string(max(1, Sys.CPU_THREADS)))),
             timeout = parse(Int, option_value(args, "--timeout", "3600")),
             only = option_values(args, "--only"),
@@ -1346,11 +1495,13 @@ function select_command(
     selection = select_testsets(root, map, String(base), String(target))
     report(stdout, map, selection, base, target)
     names = sort(unique(first.(selection.reasons)))
-    pattern = retest_pattern(names)
-    println("pattern: ", pattern)
-    println("run: julia --project=. ", map.runner, " '", pattern, "'")
+    arguments = runner_arguments(!isempty(map.suites), names)
+    if isempty(map.suites)
+        println("pattern: ", only(arguments))
+    end
+    println("run: julia --project=", map.project, " ", map.runner, " ", Base.shell_escape(arguments...))
     if run_selected && !isempty(names)
-        run(Cmd(`$(Base.julia_cmd()) --project=$root $(joinpath(root, map.runner)) $pattern`; dir = root))
+        run(Cmd(`$(Base.julia_cmd()) --project=$(joinpath(root, map.project)) $(joinpath(root, map.runner)) $arguments`; dir = root))
     end
     return nothing
 end

@@ -10,6 +10,11 @@ It expects a test entry file (default `test/runtests.jl`) that holds top-level `
 with literal names, and a runner script (default `test/runtests.jl`) that runs the testsets
 whose name matches a regex given as its first argument, as ReTest does.
 
+Alternatively, with `--suites DIR`, every file under `DIR` whose name matches
+`--suite-pattern` (default `^test_.*\.jl$`) is one testset, named by its path from `DIR`
+(`systems/test_loop.jl`). The runner then gets the selected paths as its arguments, one
+each, and a change to the runner selects every suite.
+
 ## Usage
 
 Install it into an environment of its own, so it never touches the package under test:
@@ -47,8 +52,11 @@ Options (`--root` defaults to the current directory, `--map` to `ROOT/test-impac
 | Option | Commands | Meaning |
 | --- | --- | --- |
 | `--tests FILE` | build | Test entry file, searched for testsets and followed through literal `include`s |
+| `--suites DIR` | build | Treat each matching file under `DIR` as one testset, run by its path (see above) |
+| `--suite-pattern REGEX` | build | File names that are suites under `--suites` (default `^test_.*\.jl$`) |
 | `--source DIR` | build | Source directory to cover; repeatable (default `src`) |
 | `--runner FILE` | build, run | Runner script (default `test/runtests.jl`) |
+| `--project DIR` | build | Julia project the runner runs in, relative to `--root` (default `.`); recorded in the map, so `run` uses it too |
 | `--jobs N` | build | Testsets run at once |
 | `--timeout SECONDS` | build | Per-testset limit; on timeout the process gets SIGINT, so it still writes its coverage |
 | `--only SUBSTRING` | build | Map only matching testsets, for a smoke run |
